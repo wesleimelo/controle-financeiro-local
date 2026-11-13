@@ -7,7 +7,7 @@
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
 
-  const SCHEMA = 1;
+  const SCHEMA = 2;
   const APP_ID = 'financas-pessoais';
   const METHODS = ['Pix', 'Dinheiro', 'Débito', 'Boleto', 'Outro'];
   const ALL_METHODS = METHODS.concat(['Transferência']);
@@ -125,6 +125,7 @@
       ],
       categories: DEFAULT_CATEGORIES.map((c) => ({ ...c })),
       movements: [],
+      recurring: [],
       log: [],
       settings: { onboarded: false, lastBackupAt: null, lastAccountId: null, lastMethod: null },
     };
@@ -205,7 +206,7 @@
     return out;
   }
 
-  const SNAP_FIELDS = ['type', 'desc', 'amount', 'categoryId', 'date', 'method', 'accountId', 'toAccountId', 'status', 'note', 'dueDate'];
+  const SNAP_FIELDS = ['type', 'desc', 'amount', 'categoryId', 'date', 'method', 'accountId', 'toAccountId', 'status', 'note', 'dueDate', 'plannedAmount'];
   const snapshot = (m) => Object.fromEntries(SNAP_FIELDS.map((k) => [k, m[k] == null ? null : m[k]]));
 
   function updateMovement(state, id, input, now = nowISO()) {
@@ -214,6 +215,7 @@
     const before = snapshot(m);
     const f = cleanMovementInput(state, input, { existing: m });
     Object.assign(m, f, { updatedAt: now });
+    if (m.ruleId) m.custom = true;
     pushLog(state, now, 'update', m.id, 'Editou: ' + describe(m), { before: describe({ ...before, id }) });
     return { movement: m, before };
   }
@@ -242,7 +244,7 @@
   }
 
   // Confirma um lançamento previsto como pago/recebido. NÃO cria registro novo (evita duplicar).
-  function markDone(state, id, { date, accountId } = {}, now = nowISO()) {
+  function markDone(state, id, { date, accountId, amount } = {}, now = nowISO()) {
     const m = getMovement(state, id);
     if (!m || m.deletedAt) throw new FinError('Lançamento não encontrado.');
     if (m.status !== 'planned') throw new FinError('Esse lançamento já foi confirmado.');
@@ -252,6 +254,11 @@
     const accId = accountId || m.accountId;
     const acc = getAccount(state, accId);
     if (!acc || acc.archived) throw new FinError('Escolha uma conta válida.');
+    if (amount != null) {
+      if (!Number.isInteger(amount) || amount <= 0) throw new FinError('Informe um valor maior que zero.');
+      if (amount > MAX_AMOUNT) throw new FinError('Esse valor é alto demais. Confira se digitou certo.');
+      if (amount !== m.amount) { m.plannedAmount = m.plannedAmount == null ? m.amount : m.plannedAmount; m.amount = amount; }
+    }
     if (d !== m.date) m.dueDate = m.dueDate || m.date;
     m.date = d; m.accountId = accId; m.status = 'done'; m.updatedAt = now;
     pushLog(state, now, 'done', m.id, (m.type === 'in' ? 'Recebeu: ' : 'Pagou: ') + describe(m));
@@ -348,6 +355,146 @@
       else if (daysBetween(today, m.date) <= soonDays) out.push({ kind: 'soon', days: daysBetween(today, m.date), movement: m });
     }
     return out.sort((a, b) => a.movement.date.localeCompare(b.movement.date));
+  }
+
+
+  // ---------- despesas/entradas fixas (regras mensais) ----------
+  const isYM = (s) => typeof s === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(s) && Number(s.slice(0, 4)) >= 1990 && Number(s.slice(0, 4)) <= 2100;
+  const dateInMonth = (ym, day) => `${ym}-${pad(Math.min(day, Number(lastDayOfMonth(ym).slice(8, 10))))}`;
+  const getRule = (state, id) => state.recurring.find((r) => r.id === id);
+  const MAX_AHEAD = 36;
+
+  function cleanRule(state, input, ex, today) {
+    const type = ex ? ex.type : input.type;
+    if (!['in', 'out'].includes(type)) throw new FinError('Escolha se é entrada ou saída.');
+    const name = String(input.name || '').trim().slice(0, 40);
+    if (!name) throw new FinError('Dê um nome para a despesa fixa.');
+    const amount = input.amount;
+    if (!Number.isInteger(amount) || amount <= 0) throw new FinError('Informe um valor maior que zero.');
+    if (amount > MAX_AMOUNT) throw new FinError('Esse valor é alto demais. Confira se digitou certo.');
+    const day = input.day;
+    if (!Number.isInteger(day) || day < 1 || day > 31) throw new FinError('O dia do vencimento deve ser de 1 a 31.');
+    const acc = getAccount(state, input.accountId);
+    if (!acc || (acc.archived && !(ex && ex.accountId === acc.id))) throw new FinError('Escolha uma conta válida.');
+    const categoryId = getCategory(state, input.categoryId) ? input.categoryId : 'cat-outros';
+    const method = METHODS.includes(input.method) ? input.method : 'Pix';
+    const startYm = input.startYm == null ? ymOf(today) : input.startYm;
+    if (!isYM(startYm)) throw new FinError('Mês de início inválido.');
+    const endYm = input.endYm || null;
+    if (endYm && (!isYM(endYm) || endYm < startYm)) throw new FinError('O mês final não pode ser antes do início.');
+    return { type, name, amount, day, accountId: acc.id, categoryId, method, startYm, endYm, note: String(input.note || '').trim().slice(0, 300) };
+  }
+
+  // Cria, mês a mês, os lançamentos PREVISTOS de cada regra ativa. Nunca duplica: se já existe
+  // um lançamento (mesmo apagado) para aquele mês, não cria outro. Nunca mexe no passado.
+  function generateRecurring(state, today = todayStr(), uptoYm = null, now = nowISO(), quiet = false) {
+    const cur = ymOf(today);
+    let end = addMonthsYM(cur, 3);
+    if (isYM(uptoYm) && uptoYm > end) end = uptoYm;
+    const cap = addMonthsYM(cur, MAX_AHEAD);
+    if (end > cap) end = cap;
+    let created = 0;
+    for (const r of state.recurring) {
+      if (!r.active) continue;
+      let acc = getAccount(state, r.accountId);
+      if (!acc || acc.archived) acc = activeAccounts(state)[0];
+      if (!acc) continue;
+      const have = new Set(state.movements.filter((m) => m.ruleId === r.id).map((m) => m.ruleYm));
+      for (let ym = r.startYm > cur ? r.startYm : cur; ym <= end; ym = addMonthsYM(ym, 1)) {
+        if (r.endYm && ym > r.endYm) break;
+        if (have.has(ym)) continue;
+        state.movements.push({
+          id: uid('m_'), type: r.type, desc: r.name, amount: r.amount, date: dateInMonth(ym, r.day), accountId: acc.id, toAccountId: null,
+          categoryId: getCategory(state, r.categoryId) ? r.categoryId : 'cat-outros', method: r.method, status: 'planned', note: r.note || '',
+          dueDate: null, seriesId: null, ruleId: r.id, ruleYm: ym, createdAt: now, updatedAt: now, deletedAt: null,
+        });
+        created++;
+      }
+    }
+    if (created && !quiet) pushLog(state, now, 'rule', null, `Gerou ${created} ${created === 1 ? 'lançamento previsto' : 'lançamentos previstos'} das despesas fixas`);
+    return created;
+  }
+
+  function removePlannedFromRule(state, ruleId, fromYm) {
+    state.movements = state.movements.filter((m) => !(m.ruleId === ruleId && m.status === 'planned' && !m.deletedAt && m.ruleYm >= fromYm));
+  }
+
+  function addRule(state, input, today = todayStr(), now = nowISO()) {
+    const f = cleanRule(state, input, null, today);
+    const r = { id: uid('r_'), ...f, active: true, createdAt: now, updatedAt: now };
+    state.recurring.push(r);
+    pushLog(state, now, 'rule', r.id, `Criou ${r.type === 'in' ? 'entrada' : 'despesa'} fixa: ${r.name} · ${formatMoney(r.amount)} todo dia ${r.day}`);
+    generateRecurring(state, today, null, now, true);
+    return r;
+  }
+
+  // Muda a regra daqui para frente. Pagos/recebidos e lançamentos editados à mão não são tocados.
+  function updateRule(state, id, input, today = todayStr(), now = nowISO()) {
+    const r = getRule(state, id);
+    if (!r) throw new FinError('Despesa fixa não encontrada.');
+    const f = cleanRule(state, { ...input, type: r.type }, r, today);
+    const was = `${formatMoney(r.amount)} dia ${r.day}`;
+    Object.assign(r, f, { updatedAt: now });
+    const cur = ymOf(today);
+    state.movements = state.movements.filter((m) => !(m.ruleId === r.id && m.status === 'planned' && !m.deletedAt && (m.ruleYm < r.startYm || (r.endYm && m.ruleYm > r.endYm))));
+    for (const m of state.movements) {
+      if (m.ruleId !== r.id || m.status !== 'planned' || m.deletedAt || m.custom || m.ruleYm < cur) continue;
+      Object.assign(m, { desc: r.name, amount: r.amount, categoryId: r.categoryId, accountId: r.accountId, method: r.method, note: r.note, date: dateInMonth(m.ruleYm, r.day), updatedAt: now });
+    }
+    pushLog(state, now, 'rule', r.id, `Editou fixa: ${r.name} · ${formatMoney(r.amount)} dia ${r.day}`, { before: was });
+    generateRecurring(state, today, null, now, true);
+    return r;
+  }
+
+  function setRuleActive(state, id, active, today = todayStr(), now = nowISO()) {
+    const r = getRule(state, id);
+    if (!r) throw new FinError('Despesa fixa não encontrada.');
+    r.active = !!active; r.updatedAt = now;
+    if (!r.active) removePlannedFromRule(state, r.id, ymOf(today));
+    else generateRecurring(state, today, null, now, true);
+    pushLog(state, now, 'rule', r.id, `${r.active ? 'Reativou' : 'Pausou'} fixa: ${r.name}`);
+    return r;
+  }
+
+  function deleteRule(state, id, today = todayStr(), now = nowISO()) {
+    const r = getRule(state, id);
+    if (!r) throw new FinError('Despesa fixa não encontrada.');
+    removePlannedFromRule(state, r.id, ymOf(today));
+    state.recurring = state.recurring.filter((x) => x.id !== id);
+    pushLog(state, now, 'rule', id, `Excluiu fixa: ${r.name} (o que já foi pago continua no histórico)`);
+  }
+
+  function recurringTotals(state) {
+    const t = { out: 0, in: 0, count: 0 };
+    for (const r of state.recurring) if (r.active) { t[r.type] += r.amount; t.count++; }
+    return t;
+  }
+
+  // Visão do planejamento de um mês: previsto x realizado, separado por tipo de despesa.
+  function planMonth(state, ym, today = todayStr()) {
+    const start = ym + '-01';
+    const r = {
+      ym, inReceived: 0, inPending: 0, outPaid: 0, outPending: 0, paidCount: 0, pendingCount: 0, carriedOut: 0, carriedIn: 0,
+      fixed: { paid: 0, pending: 0 }, series: { paid: 0, pending: 0 }, other: { paid: 0, pending: 0 }, planned: [], done: [],
+    };
+    for (const m of live(state)) {
+      if (m.type === 'transfer') continue;
+      const planned = m.status === 'planned';
+      if (planned && m.date < start) { if (m.type === 'out') r.carriedOut += m.amount; else r.carriedIn += m.amount; continue; }
+      if (ymOf(m.date) !== ym) continue;
+      (planned ? r.planned : r.done).push(m);
+      if (m.type === 'in') { if (planned) r.inPending += m.amount; else r.inReceived += m.amount; continue; }
+      const g = m.ruleId ? r.fixed : m.seriesId ? r.series : r.other;
+      if (planned) { g.pending += m.amount; r.outPending += m.amount; r.pendingCount++; } else { g.paid += m.amount; r.outPaid += m.amount; r.paidCount++; }
+    }
+    r.inExpected = r.inReceived + r.inPending;
+    r.outTotal = r.outPaid + r.outPending;
+    r.net = r.inExpected - r.outTotal;
+    r.planned.sort((a, b) => a.date.localeCompare(b.date));
+    r.done.sort((a, b) => b.date.localeCompare(a.date));
+    const sm = monthSummary(state, ym, today);
+    r.projected = sm.projected; r.balance = sm.balance;
+    return r;
   }
 
   // ---------- busca, filtros e sugestões ----------
@@ -550,6 +697,20 @@
       if (!c || typeof c.id !== 'string' || !c.name) throw new FinError(`Categoria ${i + 1} do backup está inválida.`);
       catIds.add(c.id);
     });
+    const rules = Array.isArray(d.recurring) ? d.recurring : [];
+    const ruleIds = new Set();
+    rules.forEach((r, i) => {
+      const bad = (why) => new FinError(`Despesa fixa ${i + 1} do backup está inválida (${why}).`);
+      if (!r || typeof r.id !== 'string' || ruleIds.has(r.id)) throw bad('id');
+      ruleIds.add(r.id);
+      if (!['in', 'out'].includes(r.type)) throw bad('tipo');
+      if (!r.name || !Number.isInteger(r.amount) || r.amount <= 0) throw bad('nome ou valor');
+      if (!Number.isInteger(r.day) || r.day < 1 || r.day > 31) throw bad('dia');
+      if (!isYM(r.startYm) || (r.endYm && !isYM(r.endYm))) throw bad('mês');
+      if (!accIds.has(r.accountId)) throw bad('conta');
+      if (!catIds.has(r.categoryId)) r.categoryId = 'cat-outros';
+      r.method = METHODS.includes(r.method) ? r.method : 'Pix'; r.active = r.active !== false; r.endYm = r.endYm || null; r.note = String(r.note || '');
+    });
     const ids = new Set();
     d.movements.forEach((m, i) => {
       const bad = (why) => new FinError(`Lançamento ${i + 1} do backup está inválido (${why}).`);
@@ -564,10 +725,11 @@
       if (m.type !== 'transfer' && !catIds.has(m.categoryId)) m.categoryId = 'cat-outros';
       m.desc = String(m.desc || ''); m.note = String(m.note || ''); m.method = ALL_METHODS.includes(m.method) ? m.method : 'Outro';
       m.deletedAt = m.deletedAt || null; m.dueDate = m.dueDate || null; m.seriesId = m.seriesId || null;
+      m.ruleId = m.ruleId || null; m.ruleYm = m.ruleYm || null; if (m.plannedAmount != null && !Number.isInteger(m.plannedAmount)) m.plannedAmount = null;
     });
     const st = {
       app: APP_ID, schema: SCHEMA, createdAt: d.createdAt || nowISO(),
-      accounts: d.accounts, categories: d.categories, movements: d.movements,
+      accounts: d.accounts, categories: d.categories, movements: d.movements, recurring: rules,
       log: Array.isArray(d.log) ? d.log.slice(-LOG_LIMIT) : [],
       settings: { onboarded: true, lastBackupAt: null, lastAccountId: null, lastMethod: null, ...(d.settings || {}) },
     };
@@ -584,6 +746,7 @@
     accountBalance, totalBalance, monthSummary, byCategory, monthlySeries, balanceEvolution, alerts,
     filterMovements, suggestCategory, descSuggestions, topShortcuts,
     addCategory, updateCategory, deleteCategory, categoryUsage, addAccount, updateAccount, setAccountArchived,
+    getRule, addRule, updateRule, setRuleActive, deleteRule, generateRecurring, recurringTotals, planMonth, dateInMonth,
     toCSV, exportBackup, validateBackup, describe,
   };
 });

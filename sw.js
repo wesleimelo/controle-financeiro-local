@@ -1,5 +1,5 @@
 /* Service worker: deixa o app abrir sem internet. Quando há internet, sempre busca a versão mais nova. */
-const VERSION = 'v1.0.0';
+const VERSION = 'v1.1.0';
 const CACHE = 'meu-dinheiro-' + VERSION;
 const FILES = ['./', './index.html', './style.css', './logic.js', './db.js', './app.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];

@@ -22,3 +22,12 @@ Para restaurar (ou passar para outro celular): **Restaurar de um arquivo**.
 ## Atualizar o app no futuro
 Substitua os arquivos no repositório. Seus dados não são afetados, pois ficam no celular.
 Se um arquivo mudar, troque também `VERSION` no começo do `sw.js` para o iPhone pegar a versão nova.
+
+## Novidades da versão 1.1 (Fase 2)
+- **Planejar** (nova aba): cada mês separado, com entradas previstas x recebidas, despesas fixas, parcelas/séries,
+  variáveis, o que falta pagar e o saldo projetado do fim do mês. Navegue pelas setas.
+- **Despesas fixas** (Mais > Despesas fixas, ou botão na aba Planejar): internet, faculdade, dízimo, assinaturas, salário...
+  Cada uma gera sozinha uma conta *prevista* por mês. Mudar o valor vale só daqui para frente.
+- **Valor real ao pagar:** ao tocar no ✓ você informa quanto pagou de verdade; o previsto fica guardado.
+- Para atualizar: substitua TODOS os arquivos do repositório por estes. Seus dados no celular não são afetados.
+  Depois feche o app por completo e abra de novo (às vezes é preciso abrir duas vezes para pegar a versão nova).
